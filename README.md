@@ -487,5 +487,3 @@ sudo -u postgres psql -d vessel_gis -c \
 ```
 
 重点监控：同步最后成功时间、最新定位时间、无效坐标数量、单次同步耗时、MySQL 慢查询、PostgreSQL 连接数、热点瓦片大小与响应时间。
-#   A I S - P o s t G I S - V t L a y e r  
- 
