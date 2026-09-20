@@ -1,0 +1,11 @@
+[Unit]
+Description=Run a full Beihai vessel reconciliation every day
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 Asia/Shanghai
+RandomizedDelaySec=10min
+Persistent=true
+Unit=vessel-reconcile.service
+
+[Install]
+WantedBy=timers.target

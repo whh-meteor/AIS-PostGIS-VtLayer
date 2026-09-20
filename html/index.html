@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>北海渔船矢量切片</title>
+  <link rel="stylesheet" href="https://unpkg.com/maptalks@1.7.1/dist/maptalks.css">
+  <style>
+    * { box-sizing: border-box; }
+    html, body, #map { width: 100%; height: 100%; margin: 0; }
+    body { overflow: hidden; font-family: "Microsoft YaHei", sans-serif; background: #07182b; }
+    #map { background: #0b2942; }
+    .toolbar {
+      position: absolute;
+      z-index: 10;
+      top: 16px;
+      right: 16px;
+      width: 310px;
+      padding: 14px 16px;
+      color: #e9f6ff;
+      background: rgba(5, 23, 40, 0.92);
+      border: 1px solid rgba(86, 207, 255, 0.42);
+      border-radius: 8px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+    }
+    .toolbar h1 { margin: 0 0 12px; font-size: 17px; }
+    .row { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+    .row label { flex: 0 0 82px; color: #a8c5d8; font-size: 13px; }
+    select {
+      flex: 1;
+      height: 32px;
+      color: #e9f6ff;
+      background: #102f49;
+      border: 1px solid #2c6e91;
+      border-radius: 4px;
+      padding: 0 8px;
+    }
+    .status { margin-top: 10px; padding-top: 10px; border-top: 1px solid #24445a; font-size: 12px; line-height: 1.7; }
+    .status-ok { color: #65e39a; }
+    .status-error { color: #ff8c8c; }
+    .endpoint { margin-top: 8px; color: #87bad6; font-size: 11px; overflow-wrap: anywhere; }
+    .area-code-status { margin-top: 6px; color: #a8c5d8; font-size: 11px; line-height: 1.5; }
+    .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 10px; margin-top: 10px; font-size: 12px; }
+    .legend-item { display: flex; align-items: center; gap: 6px; color: #d7eaf5; }
+    .legend-dot { width: 10px; height: 10px; border: 1px solid #fff; border-radius: 50%; }
+    .boat-info { margin-top: 10px; color: #d7eaf5; font-size: 12px; line-height: 1.7; }
+    .boat-info strong { color: #63d8ff; }
+  </style>
+  <script src="https://unpkg.com/maptalks@1.7.1/dist/maptalks.min.js"></script>
+  <script src="https://unpkg.com/@maptalks/gl@0.118.1/dist/maptalksgl.js"></script>
+  <script src="https://unpkg.com/@maptalks/vt@0.118.1/dist/maptalks.vt.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+  <section class="toolbar">
+    <h1>北海渔船实时点位</h1>
+    <div class="row">
+      <label for="offline-hours">报位时间</label>
+      <select id="offline-hours">
+        <option value="0">全部（最近 24 小时）</option>
+        <option value="1">最近 1 小时</option>
+        <option value="2" selected>最近 2 小时</option>
+        <option value="3">最近 3 小时</option>
+        <option value="6">最近 6 小时</option>
+        <option value="12">最近 12 小时</option>
+      </select>
+    </div>
+    <div id="status" class="status">正在检查瓦片服务……</div>
+    <div id="area-code-status" class="area-code-status">正在加载本地区域编码……</div>
+    <div class="legend" aria-label="渔船颜色图例">
+      <div class="legend-item"><span class="legend-dot" style="background:#9baab5"></span>离线渔船</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>非本地渔船</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>双控船</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#facc15"></span>乡镇船</div>
+    </div>
+    <div id="endpoint" class="endpoint"></div>
+    <div id="boat-info" class="boat-info">单击船位查看属性</div>
+  </section>
+
+  <script>
+    (async () => {
+      'use strict'
+
+      // 通过 Nginx 打开时使用当前 IP；直接打开本地文件时使用部署服务器地址。
+      const tileOrigin = window.location.protocol === 'http:' || window.location.protocol === 'https:'
+        ? window.location.origin
+        : 'http://192.168.2.60:6183'
+      const tileTemplate = `${tileOrigin}/vessel-tiles/tiles/boats/{z}/{x}/{y}.pbf`
+      // 当前真实接口不可用时不要设置；接口恢复后在本脚本之前设置完整地址。
+      const getInfoUrl = typeof window.VESSEL_GET_INFO_URL === 'string'
+        ? window.VESSEL_GET_INFO_URL.trim()
+        : ''
+
+      const statusElement = document.getElementById('status')
+      const areaCodeStatusElement = document.getElementById('area-code-status')
+      const endpointElement = document.getElementById('endpoint')
+      const boatInfoElement = document.getElementById('boat-info')
+      const offlineHoursElement = document.getElementById('offline-hours')
+
+      if (!window.maptalks || !maptalks.VectorTileLayer || !maptalks.GroupGLLayer) {
+        statusElement.className = 'status status-error'
+        statusElement.textContent = 'Maptalks 组件加载失败，请检查浏览器是否能访问 unpkg.com。'
+        return
+      }
+
+      const LAYER_NAME = 'boats';   // 必须和 SQL 里 ST_AsMVT(..., 'boats', ...) 一致
+      const MAX_Z = 14;             // boat_points_mvt 最多支持 z14
+      const CENTER = [109.12, 21.48]; // 北海附近 [经度, 纬度]
+      const COLORS = {
+        offline: '#9baab5',
+        nonLocal: '#22c55e',
+        dual: '#ef4444',
+        town: '#facc15',
+        localOther: '#20d9ff'
+      }
+
+      function addAreaCodeValue(value, result) {
+        if (typeof value === 'string' || typeof value === 'number') {
+          const code = String(value).trim()
+          if (code) result.add(code)
+        } else if (Array.isArray(value)) {
+          value.forEach((item) => addAreaCodeValue(item, result))
+        } else if (value && typeof value === 'object') {
+          collectAreaCodes(value, result)
+        }
+      }
+
+      // 同时兼容 getInfo 中的编码数组和带 children 的区域树。
+      function collectAreaCodes(value, result = new Set()) {
+        if (Array.isArray(value)) {
+          value.forEach((item) => collectAreaCodes(item, result))
+          return result
+        }
+        if (!value || typeof value !== 'object') return result
+
+        Object.entries(value).forEach(([key, child]) => {
+          if (key === 'areaCode' || key === 'areaCodes') {
+            addAreaCodeValue(child, result)
+          }
+          if (child && typeof child === 'object') {
+            collectAreaCodes(child, result)
+          }
+        })
+        return result
+      }
+
+      async function fetchJson(url, options = {}) {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 3000)
+        try {
+          const response = await fetch(url, {
+            cache: 'no-store',
+            // 默认不向跨域备用接口发送 Cookie，兼容直接双击打开页面时的 null 来源。
+            credentials: 'same-origin',
+            ...options,
+            signal: controller.signal
+          })
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          return await response.json()
+        } finally {
+          clearTimeout(timeout)
+        }
+      }
+
+      async function loadLocalAreaCodes() {
+        // 只有明确配置真实接口后才调用，避免接口未部署时产生 404/CORS 错误。
+        if (getInfoUrl) {
+          try {
+            const getInfo = await fetchJson(getInfoUrl, { credentials: 'include' })
+            const codes = [...collectAreaCodes(getInfo)]
+            if (codes.length) return { codes, source: 'getInfo接口' }
+            throw new Error('响应中没有 areaCode')
+          } catch (error) {
+            console.warn('[boats-mvt] getInfo接口不可用，改用本地脱敏结果：', error)
+          }
+        } else {
+          console.info('[boats-mvt] 未配置真实getInfo接口，使用本地脱敏结果。')
+        }
+
+        // 公共备用接口不携带 Cookie；可与 Access-Control-Allow-Origin: * 配合使用。
+        const fallback = await fetchJson(`${tileOrigin}/vessel-tiles/area-codes`, {
+          credentials: 'omit'
+        })
+        const codes = [...collectAreaCodes(fallback)]
+        if (!codes.length) throw new Error('getInfo.txt 中没有可用的 areaCode')
+        return { codes, source: fallback.source || 'getInfo.txt' }
+      }
+
+      const areaCodeResult = await loadLocalAreaCodes()
+      const localAreaCodes = areaCodeResult.codes.map(String)
+      const localAreaCodeSet = new Set(localAreaCodes)
+      areaCodeStatusElement.textContent = `本地区域：${areaCodeResult.source}（${localAreaCodes.length}个编码）`
+
+      const map = new maptalks.Map('map', {
+        center: CENTER,
+        zoom: 10,
+        minZoom: 3,
+        maxZoom: MAX_Z + 2,
+        baseLayer: new maptalks.TileLayer('base', {
+          urlTemplate: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+          subdomains: ['a', 'b', 'c', 'd'],
+          attribution: '&copy; OpenStreetMap &copy; CARTO'
+        })
+      });
+
+      let offlineHours = offlineHoursElement.value
+      let filterVersion = 1
+
+      // VectorTileLayer 会在每次创建瓦片时调用 urlTemplate 函数。
+      // 直接在这里拼接查询参数，确保参数真正进入 PBF 网络请求。
+      function buildBoatTileUrl(x, y, z) {
+        return `${tileOrigin}/vessel-tiles/tiles/boats/${z}/${x}/${y}.pbf`
+          + `?offlineHours=${encodeURIComponent(offlineHours)}`
+          + `&filterVersion=${filterVersion}`
+      }
+
+      function createPointStyle(name, filter, color) {
+        return {
+          name,
+          filter,
+          renderPlugin: {
+            type: 'icon',
+            dataConfig: { type: 'point', only2D: true },
+            sceneConfig: { depthFunc: 'always' }
+          },
+          symbol: {
+            markerType: 'ellipse',
+            markerWidth: 12,
+            markerHeight: 12,
+            markerFill: color,
+            markerLineColor: '#ffffff',
+            markerLineWidth: 1,
+            markerOpacity: 0.95
+          }
+        }
+      }
+
+      function createBoatStyle(areaCodes) {
+        const online = ['==', 'lineType', '在线']
+        const local = ['in', 'areaCode', ...areaCodes]
+        const nonLocal = ['!in', 'areaCode', ...areaCodes]
+        const dual = ['contains', 'boatManageType', '双控']
+        const town = ['contains', 'boatManageType', '乡镇']
+
+        return {
+          style: [
+            // 离线状态优先级最高，不再按本地性或船舶类型着色。
+            createPointStyle('offline-boats', ['==', 'lineType', '离线'], COLORS.offline),
+            createPointStyle('non-local-boats', ['all', online, nonLocal], COLORS.nonLocal),
+            createPointStyle('local-dual-boats', ['all', online, local, dual], COLORS.dual),
+            createPointStyle(
+              'local-town-boats',
+              ['all', online, local, town, ['none', dual]],
+              COLORS.town
+            ),
+            // 档案类型为空或出现新类型时保留可见性，避免船位无样式而消失。
+            createPointStyle(
+              'local-other-boats',
+              ['all', online, local, ['none', dual, town]],
+              COLORS.localOther
+            )
+          ]
+        }
+      }
+
+      const boatLayer = new maptalks.VectorTileLayer('boats-mvt', {
+        urlTemplate: buildBoatTileUrl,
+        minZoom: 0,
+        maxZoom: 14,
+        // 保留 MVT 要素及其属性，供点击拾取读取 data.feature.properties。
+        // 仅设置 picking: true 时只能命中图标，返回结果中不会包含 data。
+        features: true,
+        picking: true,
+        pickingPoint: true,
+        defaultRendering: false,
+        style: createBoatStyle(localAreaCodes)
+      })
+
+      new maptalks.GroupGLLayer('vessel-group', [boatLayer]).addTo(map)
+
+      function updateEndpoint() {
+        endpointElement.textContent = `${tileTemplate}?offlineHours=${offlineHours}&filterVersion=${filterVersion}`
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>'"]/g, (character) => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+        })[character])
+      }
+
+      function getBoatCategory(properties = {}) {
+        if (properties.lineType === '离线') return '离线渔船'
+
+        const areaCode = String(properties.areaCode || '')
+        if (!areaCode || !localAreaCodeSet.has(areaCode)) return '非本地渔船'
+
+        const manageType = String(properties.boatManageType || '')
+        if (manageType.includes('双控')) return '双控船'
+        if (manageType.includes('乡镇')) return '乡镇船'
+        return '其他本地船'
+      }
+
+      function showBoat(properties = {}) {
+        const fields = [
+          ['船名', properties.boatName],
+          ['船号', properties.boatCode],
+          ['终端号', properties.terminalPhone],
+          ['定位时间', properties.locationTime],
+          ['速度', properties.speed],
+          ['方向', properties.direction],
+          ['区域编码', properties.areaCode],
+          ['状态（2小时阈值）', properties.lineType],
+          ['渲染分类', getBoatCategory(properties)]
+        ]
+        boatInfoElement.innerHTML = fields
+          .filter(([, value]) => value !== null && value !== undefined && value !== '')
+          .map(([label, value]) => `<div><strong>${label}：</strong>${escapeHtml(value)}</div>`)
+          .join('') || '该船位没有可显示的属性'
+      }
+
+      // @maptalks/vt 的拾取结果不是普通 VectorLayer 的 Geometry：
+      // 当前版本的 MVT 属性位于 picked.data.feature.properties。
+      // 其余分支用于兼容不同版本的 maptalks/vt 返回结构。
+      function getPickedProperties(picked) {
+        return picked?.data?.feature?.properties
+          || picked?.data?.properties
+          || picked?.feature?.properties
+          || picked?.properties
+          || picked?.geometry?.getProperties?.()
+          || null
+      }
+
+      map.on('click', (event) => {
+        // VectorTileLayer.identify 是同步接口，直接传 Coordinate，不使用回调。
+        const items = boatLayer.identify(event.coordinate, {
+          tolerance: 8,
+          count: 1
+        })
+        const picked = items && items[0]
+        const properties = getPickedProperties(picked)
+
+        console.debug('[boats-mvt] identify result:', items)
+
+        if (properties) {
+          showBoat(properties)
+        } else if (picked) {
+          boatInfoElement.textContent = '已命中船位，但未读取到属性，请确认部署的是已开启 features 的新版页面。'
+        } else {
+          boatInfoElement.textContent = '未命中船位，请靠近点位中心后重试。'
+        }
+      })
+
+      offlineHoursElement.addEventListener('change', () => {
+        offlineHours = offlineHoursElement.value
+        filterVersion += 1
+        boatLayer.forceReload()
+        updateEndpoint()
+      })
+
+      fetch(`${tileOrigin}/vessel-tiles/health`, { cache: 'no-store' })
+        .then((response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          return response.json()
+        })
+        .then(() => {
+          statusElement.className = 'status status-ok'
+          statusElement.textContent = '瓦片服务连接正常'
+        })
+        .catch((error) => {
+          statusElement.className = 'status status-error'
+          statusElement.textContent = `瓦片服务连接失败：${error.message}`
+        })
+
+      updateEndpoint()
+    })().catch((error) => {
+      console.error('[boats-mvt] 页面初始化失败：', error)
+      const status = document.getElementById('status')
+      const areaCodeStatus = document.getElementById('area-code-status')
+      status.className = 'status status-error'
+      status.textContent = `页面初始化失败：${error.message}`
+      areaCodeStatus.textContent = '本地区域编码加载失败'
+    })
+  </script>
+</body>
+</html>

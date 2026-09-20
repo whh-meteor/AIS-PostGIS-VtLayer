@@ -1,0 +1,23 @@
+[Unit]
+Description=Daily full reconciliation of Beihai vessel data
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data/ltgk/beihai
+EnvironmentFile=/data/ltgk/beihai/config/vessel-tiles.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/test -x /home/ubuntu/miniconda3/envs/py312/bin/python
+ExecStartPre=/usr/bin/test -r /data/ltgk/beihai/sync_boats.py
+ExecStart=/home/ubuntu/miniconda3/envs/py312/bin/python /data/ltgk/beihai/sync_boats.py --full
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
